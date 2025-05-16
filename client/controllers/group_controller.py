@@ -1,15 +1,23 @@
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ContextTypes
+from telegram.ext import ContextTypes, ChatMemberHandler
 from telegram.constants import ParseMode
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from datetime import datetime, timedelta
 import logging
+
 from services.user_service import get_user_by_id
 from services.invoice_service import create_click_invoice
 from client.utils.click_utils import get_payment_status
 
 logger = logging.getLogger("group_controller")
 
-GROUP_CHAT_ID = -4685484218
-GROUP_INVITE_LINK = "https://t.me/+uzz7lKNXKaIxODYy"
+# Group IDs per duration
+GROUP_CHAT_IDS = {
+    14: -1002455748953,
+    30: -1002650518167,
+    90: -1002679985012,
+    180: -1002364265871
+}
 
 DURATION_MAP = {
     "subscribe_14": {"days": 14, "amount": 109000},
@@ -18,14 +26,14 @@ DURATION_MAP = {
     "subscribe_180": {"days": 180, "amount": 799000}
 }
 
+# Start the scheduler globally
+scheduler = AsyncIOScheduler()
+
 async def handle_paid_group_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     keyboard = [
-        [InlineKeyboardButton("📅 2 Hafta – 109,000 so'm", callback_data="subscribe_14")],
-        [InlineKeyboardButton("📅 1 Oy – 249,000 so'm", callback_data="subscribe_30")],
-        [InlineKeyboardButton("📅 3 Oy – 449,000 so'm", callback_data="subscribe_90")],
-        [InlineKeyboardButton("📅 6 Oy – 799,000 so'm", callback_data="subscribe_180")],
+        [InlineKeyboardButton("🗕 2 Hafta – 109,000 so'm", callback_data="subscribe_14")],
         [InlineKeyboardButton("🔙 Ortga", callback_data="go_back")]
     ]
     await query.edit_message_text("To'lov muddatimiz quyidagilardan iborat:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -59,6 +67,7 @@ async def handle_subscription_selection(update: Update, context: ContextTypes.DE
         payment_url = result["payment_link"]
 
         context.user_data["merchant_trans_id"] = merchant_trans_id
+        context.user_data["duration_days"] = duration
 
         keyboard = [
             [InlineKeyboardButton("💳 To'lov qilish!", url=payment_url)],
@@ -67,42 +76,79 @@ async def handle_subscription_selection(update: Update, context: ContextTypes.DE
         ]
 
         await query.edit_message_text(
-            f"💰 You selected a {duration}-day subscription for {amount} so'm.\n\nClick below to pay:",
+            f"💰 Siz {duration} kunlik obunani tanladingiz.\nNarx: {amount} so'm.\n\nTo'lov uchun quyidagi tugmani bosing:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     except Exception as e:
+        logger.error(f"Payment link generation failed: {e}")
         keyboard = [[InlineKeyboardButton("🔄 Try Again", callback_data="paid_group")]]
         await query.edit_message_text("❌ Failed to generate payment link.", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def verify_paid_group_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
-    await query.answer("Checking payment status...")
+    await query.answer("To'lov holati tekshirilmoqda...")
 
     merchant_trans_id = context.user_data.get("merchant_trans_id")
+    duration = context.user_data.get("duration_days")
 
-    if not merchant_trans_id:
-        await query.edit_message_text(
-            "❌ Payment information not found. Please try again.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Ortga", callback_data="go_back")]])
-        )
+    if not merchant_trans_id or not duration:
+        await query.edit_message_text("❌ Payment or subscription data not found. Please try again.")
         return
 
     payment_status = await get_payment_status(merchant_trans_id)
 
     if payment_status == "completed":
-        if "merchant_trans_id" in context.user_data:
-            del context.user_data["merchant_trans_id"]
+        context.user_data.pop("merchant_trans_id", None)
+        context.user_data.pop("duration_days", None)
 
-        await query.edit_message_text(
-            f"✅ To'lov tasdiqlandi, gruppa linki: \n\n👉 {GROUP_INVITE_LINK}",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        group_id = GROUP_CHAT_IDS.get(duration)
+
+        try:
+            # ✅ Create one-time link (expires in 5 mins)
+            invite = await context.bot.create_chat_invite_link(
+                chat_id=group_id,
+                member_limit=1,
+                expire_date=datetime.utcnow() + timedelta(minutes=5),
+                creates_join_request=False
+            )
+
+            # ✅ FOR TESTING 2-DAY access only for 2-week group
+            if duration == 14:
+                test_expire_time = datetime.utcnow() + timedelta(days=2)
+
+                scheduler.add_job(
+                    kick_user_after,
+                    trigger='date',
+                    run_date=test_expire_time,
+                    args=[context, group_id, user_id],
+                    id=f"kick_{user_id}_{group_id}"
+                )
+
+            await query.edit_message_text(
+                f"✅ To'lov tasdiqlandi!\n\n👉 Guruhga kirish havolasi (5 daqiqa amal qiladi):\n{invite.invite_link}",
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+        except Exception as e:
+            logger.error(f"Invite link error: {e}")
+            await query.edit_message_text("❌ Guruhga havola yaratib bo‘lmadi.")
     else:
-        await query.edit_message_text(
-            "❌ Payment not found or still processing. Please complete payment or wait a moment and try again.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Qaytadan Tekshirish", callback_data="verify_payment")],
-                [InlineKeyboardButton("🔙 Ortga", callback_data="go_back")]
-            ])
-        )
+        await query.edit_message_text("❌ To'lov topilmadi yoki hali yakunlanmagan. Qayta urinib ko‘ring.")
+
+# Kick user after duration expires
+async def kick_user_after(context, chat_id: int, user_id: int):
+    try:
+        await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+        await context.bot.unban_chat_member(chat_id=chat_id, user_id=user_id)
+        logger.info(f"Kicked user {user_id} from group {chat_id}")
+    except Exception as e:
+        logger.error(f"Kick failed: {e}")
+
+# Track when user joins
+async def track_user_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.chat_member.new_chat_member.status == "member":
+        user = update.chat_member.from_user
+        chat_id = update.chat_member.chat.id
+        logger.info(f"User {user.id} joined group {chat_id}")
+        # Optionally save join info to DB
